@@ -1,0 +1,113 @@
+pipeline {
+    agent any 
+    tools {
+        jdk 'jdk'
+        nodejs 'nodejs'
+    }
+    environment  {
+        SONAR_HOME=tool 'sonar-scanner'
+        AWS_ACCOUNT = credentials('ACCOUNT_ID')
+        AWS_ECR = credentials('REPO_1')
+        AWS_REGION = 'us-east-1'
+        REPOSITORY_URL = "${AWS_ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com/"
+    }
+    stages {
+        stage('cleaning workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('checkout code') {
+            steps {
+                git credentialsId: 'GITHUB', url: 'https://github.com/Samiabbasi1/k8s-devsecops-AWS.git'
+            }
+        }
+        stage('sonarqube checking') {
+            steps {
+                dir('appcode/frontend') {
+                    withSonarQubeEnv('sonar-server') {
+                        sh ''' $SONAR_HOME/bin/sonar-scanner \
+                        -Dsonar.projectName=frontend \
+                        -Dsonar.projectKey=frontend '''
+                    }
+                }
+            }
+        }
+        stage('Quality Check') {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-token' 
+                }
+            }
+        }
+        stage('OWASP scan') {
+            steps {
+                dir('appcode/frontend') {
+                    dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit', odcInstallation: 'DP-Check'
+                    dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                }
+            }
+        }
+        stage('trivy scan') {
+            steps {
+                dir('appcode/frontend') {
+                    sh 'trivy fs . > trivyfs.txt'
+                }
+            }
+        }
+        stage("docker build image") {
+            steps {
+                script {
+                    dir('appcode/frontend') {
+                            sh 'docker system prune -f'
+                            sh 'docker container prune -f'
+                            sh 'docker build -t ${AWS_ECR} .'
+                    }
+                }
+            }
+        }
+        stage("image pushing to ecr") {
+            steps {
+                script {
+                        sh 'aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${REPOSITORY_URL}'
+                        sh 'docker tag ${AWS_ECR} ${REPOSITORY_URL}${AWS_ECR}:${BUILD_NUMBER}'
+                        sh 'docker push ${REPOSITORY_URL}${AWS_ECR}:${BUILD_NUMBER}'
+                }
+            }
+        }
+        stage("trivy image scanning") {
+            steps {
+                sh 'trivy image ${REPOSITORY_URL}${AWS_ECR}:${BUILD_NUMBER} > trivyimage.txt' 
+            }
+        }
+        stage('Checkout Code') {
+            steps {
+                git credentialsId: 'GITHUB', url: 'https://github.com/Samiabbasi1/k8s-devsecops-AWS.git'
+            }
+        }
+        stage('Update Deployment file') {
+            environment {
+                GIT_REPO = "k8s-devsecops-AWS"
+                GIT_USER = "Samiabbasi1"
+            }
+            steps {
+                dir('k8s-manifests-file/frontend') {
+                    withCredentials([string(credentialsId: 'github', variable: 'GITHUB_TOKEN')]) {
+                        sh '''
+                            git config user.email "abdulsamiabbasi1@gmail.com"
+                            git config user.name "Samiabbasi1"
+                            BUILD_NUMBER=${BUILD_NUMBER}
+                            echo $BUILD_NUMBER
+                            imageTag=$(grep -oP '(?<=frontend:)[^ ]+' deployment.yaml)
+                            echo $imageTag
+                            sed -i "s/${AWS_ECR}:${imageTag}/${AWS_ECR}:${BUILD_NUMBER}/" deployment.yaml
+                            git add deployment.yaml
+                            git commit -m "image build tag updated to : \${BUILD_NUMBER}"
+                            git push https://${GITHUB_TOKEN}@github.com/${GIT_USER}/${GIT_REPO} HEAD:main
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
